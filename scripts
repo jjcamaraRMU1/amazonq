@@ -1,1 +1,551 @@
+// ==UserScript==
+// @name         Multi-Employee UIT + Porcentaje
+// @namespace    UIT Checker
+// @version      2.0
+// @description  Verifica el UIT por AA, quitando descansos y Load Line Injection/HR_GROUP_EVENTS
+// @author       @jjcamara
+// @match        https://fclm-portal.amazon.com/?warehouseId=*
+// @grant        GM_xmlhttpRequest
+// @connect      fclm-portal.amazon.com
+// @require      https://code.jquery.com/jquery-3.6.0.min.js
+// ==/UserScript==
 
+(function () {
+    'use strict';
+
+    // Constantes
+    const CONSTANTS = {
+        BREAKS: [['10:15', '10:45'], ['19:15', '19:45'], ['03:15', '03:45']],
+        EXCLUDED_TASKS: ['EmptyToteMoved', 'LPReceived', 'PalletReceived', 'PalletFIPSed', 
+                        'ReceiveDock', 'ItemAmnestied', 'CubiscannedItem'],
+        DECANT_JOBS: ['ItemPrepped', 'PrepOther', 'EachReceived', 'PrepStickering', 
+                      'PrepOverbox', 'PrepShrinkwrap', 'EachToted'],
+        STOW_JOBS: ['NikeStow'],
+        STYLES: {
+            CONTAINER: `
+                padding: 20px;
+                background-color: #f9f9f9;
+                border: 1px solid #ddd;
+                margin: 20px auto;
+                width: 60%;
+                border-radius: 8px;
+                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            `,
+            BUTTON: `
+                padding: 10px 20px;
+                background-color: #28a745;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            `,
+            TEXTAREA: `
+                width: 100%;
+                margin-bottom: 10px;
+                padding: 10px;
+                border-radius: 4px;
+            `,
+            TABLE: `
+                width: 100%;
+                margin-top: 20px;
+                border-collapse: collapse;
+                background-color: white;
+            `
+        }
+    };
+    // Utilidades de tiempo
+    const TimeUtils = {
+        subtractBreakTime(start, end) {
+            let breakMinutes = 0;
+            CONSTANTS.BREAKS.forEach(([breakStart, breakEnd]) => {
+                const breakStartDate = new Date(start);
+                const breakEndDate = new Date(start);
+                const [h1, m1] = breakStart.split(':');
+                const [h2, m2] = breakEnd.split(':');
+                
+                breakStartDate.setHours(parseInt(h1), parseInt(m1), 0, 0);
+                breakEndDate.setHours(parseInt(h2), parseInt(m2), 0, 0);
+                
+                if (breakEndDate < breakStartDate) {
+                    breakEndDate.setDate(breakEndDate.getDate() + 1);
+                }
+                
+                const overlapStart = new Date(Math.max(start, breakStartDate));
+                const overlapEnd = new Date(Math.min(end, breakEndDate));
+                const diff = (overlapEnd - overlapStart) / (1000 * 60);
+                
+                if (diff > 0) breakMinutes += diff;
+            });
+            return breakMinutes;
+        },
+
+        getOverlapMinutes(aStart, aEnd, bStart, bEnd) {
+            const overlapStart = new Date(Math.max(aStart, bStart));
+            const overlapEnd = new Date(Math.min(aEnd, bEnd));
+            const diff = (overlapEnd - overlapStart) / (1000 * 60);
+            return diff > 0 ? diff : 0;
+        },
+
+        getCurrentDateRange() {
+            const currentDate = new Date();
+            const startTime = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate(), 0, 0, 0);
+            const endTime = new Date(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate(), 23, 59, 59);
+            return {
+                startTime: startTime.toISOString(),
+                endTime: endTime.toISOString()
+            };
+        },
+
+        formatTime(minutes) {
+            const hours = Math.floor(minutes / 60).toString().padStart(2, '0');
+            const mins = (minutes % 60).toString().padStart(2, '0');
+            return `${hours}:${mins}`;
+        }
+    };
+
+    // Servicios API
+    const ApiService = {
+        async fetchLoadLinePeriods(warehouseId, employeeId) {
+            const { startTime, endTime } = TimeUtils.getCurrentDateRange();
+            const url = this.buildTimeDetailsUrl(warehouseId, employeeId, startTime, endTime);
+
+            return new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    onload: (response) => {
+                        try {
+                            const periods = this.parseLoadLinePeriods(response.responseText);
+                            resolve(periods);
+                        } catch {
+                            resolve([]);
+                        }
+                    },
+                    onerror: () => resolve([])
+                });
+            });
+        },
+        parseLoadLinePeriods(html) {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const rows = doc.querySelectorAll('table.ganttChart tbody tr.function-seg');
+            const periods = [];
+
+            rows.forEach(row => {
+                const textCell = row.querySelector('td[colspan="2"]');
+                if (!textCell) return;
+
+                const text = textCell.textContent.trim();
+                if (this.isExcludedPeriod(text)) {
+                    const timeData = this.extractTimeData(row);
+                    if (timeData) periods.push(timeData);
+                }
+            });
+
+            return periods;
+        },
+
+        isExcludedPeriod(text) {
+            return text.includes('Line Load Injection') || 
+                   text.includes('Case Sort') || 
+                   text.includes('Fluid') || 
+                   text.includes('Cart/Pallet Builder') ||
+                   (text.includes('HR_GROUP') && text.includes('EVENTS'));
+        },
+
+        extractTimeData(row) {
+            const startText = row.cells[1]?.textContent.trim();
+            const endText = row.cells[2]?.textContent.trim();
+            
+            if (startText && endText) {
+                const currentYear = new Date().getFullYear();
+                const start = new Date(startText.replace(/(\d{2})\/(\d{2})-(.*)/, `${currentYear}-$1-$2T$3`));
+                const end = new Date(endText.replace(/(\d{2})\/(\d{2})-(.*)/, `${currentYear}-$1-$2T$3`));
+                
+                if (!isNaN(start) && !isNaN(end)) {
+                    return { start, end };
+                }
+            }
+            return null;
+        },
+
+        async fetchWorkedTime(warehouseId, employeeId) {
+            const { startTime, endTime } = TimeUtils.getCurrentDateRange();
+            const url = this.buildTimeDetailsUrl(warehouseId, employeeId, startTime, endTime);
+
+            return new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    onload: (response) => {
+                        try {
+                            const workTimes = this.parseWorkTimes(response.responseText);
+                            resolve(workTimes);
+                        } catch {
+                            resolve({ totalStow: 0, totalDecant: 0, total: 0 });
+                        }
+                    },
+                    onerror: () => resolve({ totalStow: 0, totalDecant: 0, total: 0 })
+                });
+            });
+        },
+
+        parseWorkTimes(html) {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const rows = doc.querySelectorAll('table.ganttChart tbody tr.function-seg');
+            
+            let totalStow = 0;
+            let totalDecant = 0;
+
+            rows.forEach(row => {
+                const textCell = row.querySelector('td[colspan="2"]');
+                const timeCell = row.querySelector('td.rightAlign');
+                
+                if (!textCell || !timeCell) return;
+
+                const text = textCell.textContent.trim().toLowerCase();
+                const [h, m] = timeCell.textContent.trim().split(':').map(Number);
+                const minutes = h * 60 + m;
+
+                if (text.includes('stow')) {
+                    totalStow += minutes;
+                }
+                if (text.includes('decant') || text.includes('prep')) {
+                    totalDecant += minutes;
+                }
+            });
+
+            return {
+                totalStow,
+                totalDecant,
+                total: totalStow + totalDecant
+            };
+        },
+
+        buildTimeDetailsUrl(warehouseId, employeeId, startTime, endTime) {
+            return `https://fclm-portal.amazon.com/employee/timeDetails?employeeId=${employeeId}&warehouseId=${warehouseId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&reportFormat=HTML`;
+        }
+    };
+    // Procesador UIT
+    const UITProcessor = {
+        async calculateUIT(htmlContent, warehouseId, employeeId) {
+            const activityTable = this.findActivityTable(htmlContent);
+            if (!activityTable) return { uit: 0, uitStow: 0, uitDecant: 0 };
+
+            const { rows, indices } = this.extractTableData(activityTable);
+            const sortedRows = this.sortRowsByDate(rows, indices.eventDateIndex);
+            const loadLinePeriods = await ApiService.fetchLoadLinePeriods(warehouseId, employeeId);
+
+            return this.calculateUITFromRows(sortedRows, indices, loadLinePeriods);
+        },
+
+        findActivityTable(htmlContent) {
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlContent, 'text/html');
+            const tables = Array.from(doc.querySelectorAll('table'));
+
+            return tables.find(table => {
+                const headers = Array.from(table.querySelectorAll('th')).map(th => th.textContent.trim());
+                return headers.includes('Event Date/Time') && headers.includes('Job Action');
+            });
+        },
+
+        extractTableData(table) {
+            const headers = Array.from(table.querySelectorAll('th'));
+            const rows = Array.from(table.querySelectorAll('tbody tr'));
+            
+            return {
+                rows,
+                indices: {
+                    eventDateIndex: headers.findIndex(th => th.textContent.includes('Event Date/Time')),
+                    jobActionIndex: headers.findIndex(th => th.textContent.includes('Job Action'))
+                }
+            };
+        },
+
+        sortRowsByDate(rows, eventDateIndex) {
+            return rows.sort((a, b) => {
+                const dateA = new Date(a.cells[eventDateIndex].textContent.trim().replace(/ [A-Z]{3,4}$/, ''));
+                const dateB = new Date(b.cells[eventDateIndex].textContent.trim().replace(/ [A-Z]{3,4}$/, ''));
+                return dateA - dateB;
+            });
+        },
+
+        calculateUITFromRows(rows, indices, loadLinePeriods) {
+            let uitTotal = 0;
+            let uitStow = 0;
+            let uitDecant = 0;
+
+            for (let i = 0; i < rows.length - 1; i++) {
+                const currentRow = rows[i];
+                const nextRow = rows[i + 1];
+                
+                const currentTime = new Date(currentRow.cells[indices.eventDateIndex].textContent.trim().replace(/ [A-Z]{3,4}$/, ''));
+                const nextTime = new Date(nextRow.cells[indices.eventDateIndex].textContent.trim().replace(/ [A-Z]{3,4}$/, ''));
+                const jobAction = currentRow.cells[indices.jobActionIndex].textContent.trim();
+
+                let diffMinutes = (nextTime - currentTime) / (1000 * 60);
+                diffMinutes -= TimeUtils.subtractBreakTime(currentTime, nextTime);
+
+                loadLinePeriods.forEach(({ start, end }) => {
+                    diffMinutes -= TimeUtils.getOverlapMinutes(currentTime, nextTime, start, end);
+                });
+
+                if (diffMinutes > 5 && !CONSTANTS.EXCLUDED_TASKS.includes(jobAction)) {
+                    uitTotal += diffMinutes;
+                    
+                    if (CONSTANTS.STOW_JOBS.includes(jobAction)) {
+                        uitStow += diffMinutes;
+                    } else if (CONSTANTS.DECANT_JOBS.includes(jobAction)) {
+                        uitDecant += diffMinutes;
+                    }
+                }
+            }
+
+            return {
+                uit: Math.round(uitTotal),
+                uitStow: Math.round(uitStow),
+                uitDecant: Math.round(uitDecant)
+            };
+        }
+    };
+
+    // UI Manager
+    const UIManager = {
+        init() {
+            this.container = this.createContainer();
+            this.inputField = this.createInputField();
+            this.checkButton = this.createCheckButton();
+            this.resultsTable = this.createResultsTable();
+
+            this.setupUI();
+            this.bindEvents();
+            this.addStyles();
+        },
+
+        createContainer() {
+            return $('<div>', {
+                id: 'uitChecker',
+                style: CONSTANTS.STYLES.CONTAINER
+            });
+        },
+
+        createInputField() {
+            return $('<textarea>', {
+                rows: 5,
+                cols: 50,
+                placeholder: 'Ingresa los IDs de empleados (uno por línea)',
+                style: CONSTANTS.STYLES.TEXTAREA
+            });
+        },
+
+        createCheckButton() {
+            return $('<button>', {
+                text: 'Verificar UIT',
+                style: CONSTANTS.STYLES.BUTTON
+            });
+        },
+
+        createResultsTable() {
+            return $(`
+                <table style="${CONSTANTS.STYLES.TABLE}">
+                    <thead>
+                        <tr>
+                            <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">ID Empleado</th>
+                            <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">UIT (min)</th>
+                            <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">UIT %</th>
+                            <th style="padding: 10px; text-align: left; border-bottom: 2px solid #ddd;">Detalles</th>
+                        </tr>
+                    </thead>
+                    <tbody></tbody>
+                </table>
+            `);
+        },
+
+        setupUI() {
+            this.container.append(
+                $('<h2>', {
+                    text: 'Verificador de UIT Múltiple',
+                    style: 'margin-bottom: 15px;'
+                }),
+                this.inputField,
+                this.checkButton,
+                this.resultsTable
+            );
+
+            $('body').prepend(this.container);
+        },
+
+        addStyles() {
+            $('<style>').text(`
+                #uitChecker table tr:nth-child(even) { background-color: #f8f9fa; }
+                #uitChecker table td { padding: 10px; border-bottom: 1px solid #ddd; }
+                #uitChecker table tr:hover { background-color: #f5f5f5; }
+                .details-button { 
+                    padding: 5px 10px;
+                    background-color: #007bff;
+                    color: white;
+                    border: none;
+                    border-radius: 3px;
+                    cursor: pointer;
+                }
+                .details-button:hover {
+                    background-color: #0056b3;
+                }
+            `).appendTo('head');
+        },
+
+        async processEmployee(id, warehouseId) {
+            const { startTime, endTime } = TimeUtils.getCurrentDateRange();
+            const url = `https://fclm-portal.amazon.com/employee/activityDetails?employeeId=${id}&warehouseId=${warehouseId}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&reportFormat=HTML`;
+
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url,
+                    onload: async (response) => {
+                        try {
+                            const uitData = await UITProcessor.calculateUIT(response.responseText, warehouseId, id);
+                            const workTime = await ApiService.fetchWorkedTime(warehouseId, id);
+                            
+                            const uitPercent = workTime.total > 0 
+                                ? ((uitData.uit / workTime.total) * 100).toFixed(2)
+                                : '0.00';
+
+                            resolve({
+                                id,
+                                ...uitData,
+                                uitPercent,
+                                workTime
+                            });
+                        } catch (e) {
+                            reject(e);
+                        }
+                    },
+                    onerror: reject
+                });
+            });
+        },
+        createResultRow(result) {
+            const detailsButton = $('<button>', {
+                class: 'details-button',
+                text: 'Ver Detalles',
+                click: () => this.showDetailsModal(result)
+            });
+
+            return $('<tr>').append(
+                $('<td>').text(result.id),
+                $('<td>', {
+                    style: `color: ${result.uit > 30 ? 'red' : 'green'}`
+                }).text(result.uit),
+                $('<td>').text(`${result.uitPercent}%`),
+                $('<td>').append(detailsButton)
+            );
+        },
+
+        showDetailsModal(result) {
+            const modal = $('<div>', {
+                style: `
+                    position: fixed;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    background: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    box-shadow: 0 0 15px rgba(0,0,0,0.3);
+                    z-index: 1000;
+                    min-width: 300px;
+                `
+            }).append(
+                $('<h3>').text(`Detalles para ${result.id}`),
+                $('<p>').text(`UIT Total: ${result.uit} minutos (${result.uitPercent}%)`),
+                $('<p>').text(`UIT Stow: ${result.uitStow} minutos`),
+                $('<p>').text(`UIT Decant: ${result.uitDecant} minutos`),
+                $('<hr>'),
+                $('<p>').text(`Tiempo Total Trabajado: ${result.workTime.total} minutos`),
+                $('<p>').text(`Tiempo Stow: ${result.workTime.totalStow} minutos`),
+                $('<p>').text(`Tiempo Decant: ${result.workTime.totalDecant} minutos`),
+                $('<button>', {
+                    text: 'Cerrar',
+                    style: 'margin-top: 10px;',
+                    click: () => {
+                        modal.remove();
+                        overlay.remove();
+                    }
+                })
+            );
+
+            const overlay = $('<div>', {
+                style: `
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    right: 0;
+                    bottom: 0;
+                    background: rgba(0,0,0,0.5);
+                    z-index: 999;
+                `
+            }).click(() => {
+                modal.remove();
+                overlay.remove();
+            });
+
+            $('body').append(overlay, modal);
+        },
+
+        bindEvents() {
+            this.checkButton.on('click', async () => {
+                const warehouseId = new URLSearchParams(window.location.search).get('warehouseId') || 'RMU1';
+                const employeeIds = this.inputField.val()
+                    .split('\n')
+                    .map(id => id.trim())
+                    .filter(id => /^[A-Za-z0-9]+$/.test(id));
+
+                if (employeeIds.length === 0) {
+                    alert('Por favor, ingrese al menos un ID de empleado válido.');
+                    return;
+                }
+
+                const tbody = this.resultsTable.find('tbody').empty();
+                this.checkButton.prop('disabled', true).text('Procesando...');
+
+                for (const id of employeeIds) {
+                    tbody.append(`<tr id="row-${id}"><td>${id}</td><td colspan="3">Cargando...</td></tr>`);
+                    
+                    try {
+                        const result = await this.processEmployee(id, warehouseId);
+                        $(`#row-${id}`).replaceWith(this.createResultRow(result));
+                    } catch (error) {
+                        console.error(`Error procesando ${id}:`, error);
+                        $(`#row-${id}`).html(
+                            `<td>${id}</td><td colspan="3" style="color: red">Error al procesar datos</td>`
+                        );
+                    }
+                }
+
+                this.checkButton.prop('disabled', false).text('Verificar UIT');
+                this.sortResultsTable();
+            });
+        },
+
+        sortResultsTable() {
+            const tbody = this.resultsTable.find('tbody');
+            const rows = tbody.find('tr').get();
+            
+            rows.sort((a, b) => {
+                const uitA = parseFloat($(a).find('td').eq(1).text()) || 0;
+                const uitB = parseFloat($(b).find('td').eq(1).text()) || 0;
+                return uitB - uitA;
+            });
+
+            tbody.empty().append(rows);
+        }
+    };
+
+    // Inicialización
+    $(document).ready(() => {
+        UIManager.init();
+    });
+})();
